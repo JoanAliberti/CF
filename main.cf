@@ -1,0 +1,1571 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'infra deployment'
+
+Parameters:
+###################### Parametros generales ##########################
+  ambiente:
+    Type: String
+    Description: 'dev/qa/prod'
+    Default: "completar"
+  myVPC:            
+    Type: String
+    Description: 'vpc'  
+    Default: 'vpc-123' #qa         
+  subnetA:          
+    Type: String
+    Description: 'Subnet A'
+    Default: 'subnet-123' #qa
+  subnetB:                                        
+    Type: String
+    Description: 'Subnet B'
+    Default: 'subnet-1234' #qa
+  roleKMSejecucion:          
+    Type: String
+    Description: 'role para crear el KMS'
+    Default: 'arn:aws:iam::123asd:user/asd.asd' #qa
+  usuarioKMSRoot:          
+    Type: String
+    Description: 'usuario con acceso root para KMS'
+    Default: 'arn:aws:iam::asdqwe123:root'
+  emailIdentity:
+    Type: String
+    Description: 'email o domain a verificar'
+    Default: 'noreply_qa@asd.com' #qa        
+  myVPCCidrBlock:
+    Type: String
+    Description: 'cidr block for VPC'
+    Default: '10.60.13.0/25' #qa   
+  AmazonMQuser:
+    Type: String
+    Description: 'usuario para AmazonMQ'
+    Default: "usuario"               #reemplazar/almacenar en Secrets Manager manualmente?
+  AmazonMQpass:
+    Type: String
+    Description: 'pass para AmazonMQ'
+    Default: "password"             #reemplazar/almacenar en Secrets Manager manualmente?
+  certificado:
+    Type: String
+    Description: 'Certificado de la CA que se va usar en los servidores web'
+    Default: "arn:aws:acm:us-east-1:asdfwqdd2:certificate/123dqq22-7559-4fe6-asdf-53f9bf401e21"
+  backdomain:
+    Type: String
+    Description: 'dominio del backend (ejemplo bffqa.asd.com)'
+    Default: bffqa.asd.com
+#  deployUser:
+#    Type: String
+#    Description: 'usuario para despliegue'
+#    Default: "" 
+####### parametros ECS
+  imagenContainerfrontend:
+    Type: String
+    Description: 'imagen docker para el frontend dentro del ECS'
+    Default: IMAGE_NAME     
+  imagenContainerbff:
+    Type: String
+    Description: 'imagen docker para el bff dentro del ECS'
+    Default: IMAGE_NAME     
+  imagenContainerconsumers:
+    Type: String
+    Description: 'imagen docker para el onsumers dentro del ECS'
+    Default: IMAGE_NAME  
+  imagenContainerproducer:
+    Type: String
+    Description: 'imagen docker para el producer dentro del ECS'
+    Default: IMAGE_NAME  
+  ContainerPortfrontend:
+    Type: Number
+    Default: 8081
+  ContainerPortbff:
+    Type: Number
+    Default: 3001 
+  ContainerPortconsumers:
+    Type: Number
+    Default: 3003
+  ContainerPortproducer:
+    Type: Number
+    Default: 3002
+  HealthCheckPath:
+    Type: String
+    Default: /              # /healthcheck
+  MinContainers:      
+    Type: Number
+    Default: 2
+  MaxContainers:     
+    Type: Number
+    Default: 4
+  AutoScalingTargetValue:    # target CPU utilization (%)
+    Type: Number
+    Default: 90
+
+
+Resources:
+########################### Amazon MQ (Rabbit MQ) ########################### 
+# creacion de SG para RabbitMQ
+  MQSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-sg-rabbitMQ'
+      GroupDescription: Allow traffic to RabbitMQ
+      VpcId: !Ref myVPC   
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ContainerSecurityGroup   
+        - IpProtocol: tcp
+          FromPort: 443   
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ContainerSecurityGroup   
+        - IpProtocol: tcp
+          FromPort: 8162      
+          ToPort: 8162
+          SourceSecurityGroupId: !Ref ContainerSecurityGroup       
+        - IpProtocol: tcp
+          FromPort: 15671   
+          ToPort: 15671
+          SourceSecurityGroupId: !Ref ContainerSecurityGroup       
+        - IpProtocol: tcp
+          FromPort: 61617     #OpenWire
+          ToPort: 61617
+          SourceSecurityGroupId: !Ref ContainerSecurityGroup      
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65000
+          SourceSecurityGroupId: !Ref ContainerSecurityGroup                                        
+      SecurityGroupEgress:      
+        - IpProtocol: tcp
+          FromPort: 0     
+          ToPort: 65000   
+          CidrIp: 0.0.0.0/0
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente
+
+# creacion de secreto para AmazonMQ
+  MySecretDBAmazonMQ:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: !Sub '${AWS::StackName}-AmazonMQ-secrets'    
+      Description: AmazonMQ Administrador credenciales
+      SecretString: !Join [ "", ['{"Username":"', !Ref AmazonMQuser,'","Password":"', !Ref AmazonMQpass,'"}']]    
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente
+
+# creacion de AmazonMQ RabbitMQ broker
+  BasicBroker:
+    Type: 'AWS::AmazonMQ::Broker'
+    DependsOn: MySecretDBAmazonMQ
+    Properties: 
+      AutoMinorVersionUpgrade: "false"
+      BrokerName: !Sub '${AWS::StackName}-RabbitMQBroker'    
+      DeploymentMode: SINGLE_INSTANCE       #CLUSTER_MULTI_AZ    
+      EngineType: RabbitMQ
+      EngineVersion: "3.10.10"  #"3.8.6"
+      HostInstanceType: mq.t3.micro     #mq.m5.large   #requerido para Cluster deployment en multiple AZ
+      #Logs:
+      #  General: true                  #habilitar para PROD
+      StorageType: ebs                  #unico tipo soportado en RabbitMQ       20 GB for mq.*.micro / 200 GB for mq.*.*large 
+      PubliclyAccessible: true   #false       
+      #SecurityGroups:
+      #  - !Ref MQSecurityGroup     
+      SubnetIds:
+        - !Ref subnetA   
+        #- !Ref subnetB   
+      Users:      #administrador de RabbitMQ  -> one and only one administrative user is accepted and created when a broker is first provisioned. All subsequent RabbitMQ users are created by via the RabbitMQ web console or by using the RabbitMQ management API.
+        - Password:  !Join ['', ['{{resolve:secretsmanager:', !Sub '${AWS::StackName}-AmazonMQ-secrets', ':SecretString:Password}}' ]]    
+          Username:  !Join ['', ['{{resolve:secretsmanager:', !Sub '${AWS::StackName}-AmazonMQ-secrets', ':SecretString:Username}}' ]]     
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente
+
+
+########################### EFS ##################################
+# SG para EFS
+  EFSsecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-sg-efs'
+      GroupDescription: Allow traffic from containers
+      VpcId: !Ref myVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049        #requerido para EFS
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref ContainerSecurityGroup    
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65000
+          SourceSecurityGroupId: !Ref ContainerSecurityGroup             
+      SecurityGroupEgress:      
+        - IpProtocol: tcp
+          FromPort: 0     
+          ToPort: 65000   
+          CidrIp: 0.0.0.0/0
+
+# IAM role para acceder al EFS
+  EFSroleIAM:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-EFSrole' 
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonECS_FullAccess
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente
+
+# creacion del EFS
+  FileSystemResource:
+    Type: 'AWS::EFS::FileSystem'
+    DependsOn: EFSroleIAM
+    Properties:
+      PerformanceMode: maxIO
+      Encrypted: true
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-efs'
+        - Key: project
+          Value: smartflux
+        - Key: environment
+          Value: !Ref ambiente  
+      FileSystemPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "elasticfilesystem:*"
+            Principal: 
+                AWS: !GetAtt EFSroleIAM.Arn
+
+
+#creacion del Mount Target para subnet 1
+  MountTargetResource1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystemResource
+      SubnetId: !Ref subnetA
+      SecurityGroups:
+      - !Ref EFSsecurityGroup   
+
+#creacion del Mount Target para subnet 2
+  MountTargetResource2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystemResource
+      SubnetId: !Ref subnetB
+      SecurityGroups:
+      - !Ref EFSsecurityGroup   
+ 
+
+######################################### ECS ########################################
+# creacion del cluster
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName:  !Sub '${AWS::StackName}-cluster' 
+
+#creacion de Logs Groups
+  LogGroupfrontend:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/ecs/, !Sub '${AWS::StackName}', TaskDefinitionfrontend]]
+      RetentionInDays: 30
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente
+
+  LogGroupbff:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/ecs/, !Sub '${AWS::StackName}', TaskDefinitionbff]]
+      RetentionInDays: 30
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente      
+
+  LogGroupconsumers:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/ecs/, !Sub '${AWS::StackName}', TaskDefinitionconsumers]]
+      RetentionInDays: 30
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente      
+
+  LogGroupproducer:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/ecs/, !Sub '${AWS::StackName}', TaskDefinitionproducer]]
+      RetentionInDays: 30
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente      
+
+# creacion de la Task Definition frontend
+  TaskDefinitionfrontend:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: LogGroupfrontend    
+    Properties:
+      Family: !Sub '${AWS::StackName}-taskDefinitionfrontend'   
+      NetworkMode: awsvpc       
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 256
+      Memory: 1GB
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn             
+      ContainerDefinitions:
+        - Name: !Sub '${AWS::StackName}-containerfrontend'   
+          MountPoints:                
+          - 
+            SourceVolume: !Ref FileSystemResource   
+            ContainerPath: "/mnt/efs"    
+          Image: !Ref imagenContainerfrontend  
+          PortMappings:
+            - ContainerPort: !Ref ContainerPortfrontend
+          LogConfiguration:       #CloudWatch Logs
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref LogGroupfrontend
+              awslogs-stream-prefix: ecs
+      Volumes: 
+        - Name: !Ref FileSystemResource  
+
+# creacion de la Task Definition bff
+  TaskDefinitionbff:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: LogGroupbff    
+    Properties:
+      Family: !Sub '${AWS::StackName}-taskDefinitionbff'   
+      NetworkMode: awsvpc       
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 256
+      Memory: 1GB
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn              
+      ContainerDefinitions:
+        - Name: !Sub '${AWS::StackName}-containerbff'   
+          MountPoints:                
+          - 
+            SourceVolume: !Ref FileSystemResource   
+            ContainerPath: "/mnt/efs"    
+          Image: !Ref imagenContainerbff  
+          PortMappings:
+            - ContainerPort: !Ref ContainerPortbff
+          LogConfiguration:       #CloudWatch Logs
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref LogGroupbff
+              awslogs-stream-prefix: ecs
+      Volumes: 
+        - Name: !Ref FileSystemResource  
+
+# creacion de la Task Definition consumers
+  TaskDefinitionconsumers:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: LogGroupconsumers    
+    Properties:
+      Family: !Sub '${AWS::StackName}-taskDefinitionconsumers'   
+      NetworkMode: awsvpc       
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 256
+      Memory: 1GB
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn              
+      ContainerDefinitions:
+        - Name: !Sub '${AWS::StackName}-containerconsumers'   
+          MountPoints:                
+          - 
+            SourceVolume: !Ref FileSystemResource   
+            ContainerPath: "/mnt/efs"    
+          Image: !Ref imagenContainerconsumers  
+          PortMappings:
+            - ContainerPort: !Ref ContainerPortconsumers
+          LogConfiguration:       #CloudWatch Logs
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref LogGroupconsumers
+              awslogs-stream-prefix: ecs
+      Volumes: 
+        - Name: !Ref FileSystemResource  
+
+# creacion de la Task Definition producer
+  TaskDefinitionproducer:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: LogGroupproducer    
+    Properties:
+      Family: !Sub '${AWS::StackName}-taskDefinitionproducer'   
+      NetworkMode: awsvpc       
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 256
+      Memory: 1GB
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn              
+      ContainerDefinitions:
+        - Name: !Sub '${AWS::StackName}-containerproducer'   
+          MountPoints:                
+          - 
+            SourceVolume: !Ref FileSystemResource   
+            ContainerPath: "/mnt/efs"    
+          Image: !Ref imagenContainerproducer  
+          PortMappings:
+            - ContainerPort: !Ref ContainerPortproducer
+          LogConfiguration:       #CloudWatch Logs
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref LogGroupproducer
+              awslogs-stream-prefix: ecs
+      Volumes: 
+        - Name: !Ref FileSystemResource  
+
+  # IAM role para ejecutar ECS
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ECSexecutionRole'     
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+        - 'arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonS3FullAccess'
+        - 'arn:aws:iam::aws:policy/AWSKeyManagementServicePowerUser'
+        - arn:aws:iam::aws:policy/AmazonSESFullAccess
+
+  # IAM role para los containers
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ECStaskRole'    
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonS3FullAccess'   
+        - 'arn:aws:iam::aws:policy/AWSKeyManagementServicePowerUser'    
+        - arn:aws:iam::aws:policy/AmazonSESFullAccess
+
+  # IAM role para auto scaling
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ECSautoScaling'      
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole'
+  
+  #SG para el cluster/containers
+  ContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-sg-container'
+      GroupDescription: !Sub '${AWS::StackName}-ECScontainerSecurityGroup'    
+      VpcId: !Ref myVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPortfrontend
+          ToPort: !Ref ContainerPortfrontend
+          CidrIp: !Ref myVPCCidrBlock   
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPortbff
+          ToPort: !Ref ContainerPortbff
+          CidrIp: !Ref myVPCCidrBlock  
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPortconsumers
+          ToPort: !Ref ContainerPortconsumers
+          CidrIp: !Ref myVPCCidrBlock  
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPortproducer
+          ToPort: !Ref ContainerPortproducer
+          CidrIp: !Ref myVPCCidrBlock  		  
+#        - IpProtocol: tcp
+#          FromPort: !Ref ContainerPortCron
+#          ToPort: !Ref ContainerPortCron   CidrIp: !Ref myVPCCidrBlock 
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref myVPCCidrBlock   
+
+#creacion del service frontend
+  Servicefrontend:
+    Type: AWS::ECS::Service
+    DependsOn:         # requerido para el LB
+      - Listenerfrontend
+      - PrivateNamespace
+      - DiscoveryServicefrontend      
+    Properties: 
+      ServiceName: !Sub '${AWS::StackName}-ECSservicefrontend'  
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinitionfrontend
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      DesiredCount: 0       
+      HealthCheckGracePeriodSeconds: 30   
+      LaunchType: FARGATE
+      NetworkConfiguration: 
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED  
+          Subnets:
+            - !Ref subnetA
+            - !Ref subnetB
+          SecurityGroups:
+            - !Ref ContainerSecurityGroup
+      LoadBalancers:
+        - ContainerName: !Sub '${AWS::StackName}-containerfrontend' 
+          ContainerPort: !Ref ContainerPortfrontend
+          TargetGroupArn: !Ref TargetGroupfrontend
+      ServiceRegistries:
+        - RegistryArn: !GetAtt DiscoveryServicefrontend.Arn
+          Port: 80
+
+  #creacion del service bff
+  Servicebff:
+    Type: AWS::ECS::Service
+    DependsOn:         # requerido para el LB
+      - Listenerbff
+      - PrivateNamespace
+      - DiscoveryServicebff      
+    Properties: 
+      ServiceName: !Sub '${AWS::StackName}-ECSservicebff'  
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinitionbff
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      DesiredCount: 0       
+      HealthCheckGracePeriodSeconds: 30  
+      LaunchType: FARGATE
+      NetworkConfiguration: 
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED    
+          Subnets:
+            - !Ref subnetA
+            - !Ref subnetB
+          SecurityGroups:
+            - !Ref ContainerSecurityGroup
+      LoadBalancers:
+        - ContainerName: !Sub '${AWS::StackName}-containerbff' 
+          ContainerPort: !Ref ContainerPortbff
+          TargetGroupArn: !Ref TargetGroupbff
+      ServiceRegistries:
+        - RegistryArn: !GetAtt DiscoveryServicebff.Arn
+          Port: 80
+
+  #creacion del service consumers
+  Serviceconsumers:
+    Type: AWS::ECS::Service
+    DependsOn:         # requerido para el LB
+      - Listenerconsumers
+      - PrivateNamespace
+      - DiscoveryServiceconsumers      
+    Properties: 
+      ServiceName: !Sub '${AWS::StackName}-ECSserviceconsumers'  
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinitionconsumers
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      DesiredCount: 0       
+      HealthCheckGracePeriodSeconds: 30  
+      LaunchType: FARGATE
+      NetworkConfiguration: 
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED    
+          Subnets:
+            - !Ref subnetA
+            - !Ref subnetB
+          SecurityGroups:
+            - !Ref ContainerSecurityGroup
+      LoadBalancers:
+        - ContainerName: !Sub '${AWS::StackName}-containerconsumers' 
+          ContainerPort: !Ref ContainerPortconsumers
+          TargetGroupArn: !Ref TargetGroupconsumers
+      ServiceRegistries:
+        - RegistryArn: !GetAtt DiscoveryServiceconsumers.Arn
+          Port: 80
+
+  #creacion del service producer
+  Serviceproducer:
+    Type: AWS::ECS::Service
+    DependsOn:         # requerido para el LB
+      - Listenerproducer
+      - PrivateNamespace
+      - DiscoveryServiceproducer     
+    Properties: 
+      ServiceName: !Sub '${AWS::StackName}-ECSserviceproducer'  
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinitionproducer
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      DesiredCount: 0       
+      HealthCheckGracePeriodSeconds: 30  
+      LaunchType: FARGATE
+      NetworkConfiguration: 
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED    
+          Subnets:
+            - !Ref subnetA
+            - !Ref subnetB
+          SecurityGroups:
+            - !Ref ContainerSecurityGroup
+      LoadBalancers:
+        - ContainerName: !Sub '${AWS::StackName}-containerproducer' 
+          ContainerPort: !Ref ContainerPortproducer
+          TargetGroupArn: !Ref TargetGroupproducer
+      ServiceRegistries:
+        - RegistryArn: !GetAtt DiscoveryServiceproducer.Arn
+          Port: 80
+
+  #creacion de Target Groups
+  TargetGroupfrontend:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      Name: !Sub '${AWS::StackName}-TG-frontend'  
+      Port: !Ref ContainerPortfrontend
+      Protocol: HTTP   #HTTP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 60 
+      TargetType: ip
+      VpcId: !Ref myVPC
+
+  TargetGroupbff:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      #HealthCheckPath: "/healthcheck/"
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      Name: !Sub '${AWS::StackName}-TG-bff'  
+      Port: !Ref ContainerPortbff
+      Protocol: TCP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 60 # default is 300
+      TargetType: ip
+      VpcId: !Ref myVPC
+
+  TargetGroupconsumers:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      #HealthCheckPath: "/healthcheck/"
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      Name: !Sub '${AWS::StackName}-TG-consumers'  
+      Port: !Ref ContainerPortconsumers
+      Protocol: TCP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 60 # default is 300
+      TargetType: ip
+      VpcId: !Ref myVPC
+
+  TargetGroupproducer:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      #HealthCheckPath: "/healthcheck/"
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      Name: !Sub '${AWS::StackName}-TG-producer'  
+      Port: !Ref ContainerPortproducer
+      Protocol: TCP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 60 # default is 300
+      TargetType: ip
+      VpcId: !Ref myVPC
+
+# creacion de Listeners 
+  Listenerfrontend:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroupfrontend
+          Type: forward
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref certificado
+
+  Listenerfrontendredirect:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: '443'
+            StatusCode: HTTP_301
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+#      Certificates:
+#        - CertificateArn: !Ref certificado
+
+  Listenerbff:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroupbff
+          Type: forward
+      LoadBalancerArn: !Ref NetworkLoadBalancer
+      Port: !Ref ContainerPortbff    
+      Protocol: TCP
+#      Certificates:
+#        - CertificateArn: !Ref certificado
+
+  Listenerconsumers:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroupconsumers
+          Type: forward
+      LoadBalancerArn: !Ref NetworkLoadBalancer
+      Port: !Ref ContainerPortconsumers    
+      Protocol: TCP 
+
+  Listenerproducer:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroupproducer
+          Type: forward
+      LoadBalancerArn: !Ref NetworkLoadBalancer
+      Port: !Ref ContainerPortproducer     
+      Protocol: TCP
+
+
+# creacion del ALB
+  ApplicationLoadBalancer:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties:
+      Name: !Sub '${AWS::StackName}-alb'
+      IpAddressType: "ipv4"
+      Type: "application"
+      Subnets:
+        - !Ref subnetA
+        - !Ref subnetB
+      LoadBalancerAttributes:
+        - Key: "deletion_protection.enabled"
+          Value: false
+        - Key: "access_logs.s3.enabled"
+          Value: false
+        - Key: "load_balancing.cross_zone.enabled"
+          Value: true
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente
+
+# creacion del NLB
+  NetworkLoadBalancer:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties:
+      Name: !Sub '${AWS::StackName}-nlb'
+      IpAddressType: "ipv4"
+      Type: "network"
+      Scheme: "internal"   #internal | internet-facing
+      Subnets:
+        - !Ref subnetA
+        - !Ref subnetB
+      LoadBalancerAttributes:
+        - Key: "deletion_protection.enabled"
+          Value: false
+        - Key: "access_logs.s3.enabled"
+          Value: false
+        - Key: "load_balancing.cross_zone.enabled"
+          Value: false
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente
+
+# creacion de  APIGATEWAY
+########################### API GATEWAY ########################### 
+  ApiGwSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-sg-apigw'
+      GroupDescription: !Sub '${AWS::StackName}-sg-apigw'    
+      VpcId: !Ref myVPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 3001
+          ToPort: 3001
+          CidrIp: 0.0.0.0/0
+
+# creacion de VPC link configurada a las subnets privadas
+  VpcLink:
+      Type: 'AWS::ApiGatewayV2::VpcLink'
+      Properties:
+          Name: !Sub '${AWS::StackName}-APIGWVpcLinkToPrivateHTTPEndpoint'   
+          SubnetIds: 
+            - !Ref subnetA
+            - !Ref subnetB
+          SecurityGroupIds: 
+            - !Ref ApiGwSecurityGroup
+  
+# creacion del API Gateway HTTP endpoint
+# creacion del API Gateway HTTP_PROXY integration 
+# creacion del API GW route 
+# creacion del stage
+# creacion del API Gateway HTTP endpoint
+  APIGWHTTPEndpointBff:
+      Type: 'AWS::ApiGatewayV2::Api'
+      Properties:
+          Name: !Sub '${AWS::StackName}-apigw-Bff'
+          ProtocolType: HTTP
+ 
+# creacion del API Gateway HTTP_PROXY integration 
+  APIGWHTTPEndpointIntegrationBff:
+      Type: 'AWS::ApiGatewayV2::Integration'
+      Properties:
+        ApiId: !Ref APIGWHTTPEndpointBff
+        IntegrationType: HTTP_PROXY
+        ConnectionId: !Ref VpcLink
+        ConnectionType: VPC_LINK
+        IntegrationMethod: ANY
+        IntegrationUri: !Ref Listenerbff
+        PayloadFormatVersion: '1.0'
+      DependsOn:
+      - VpcLink
+      - APIGWHTTPEndpointBff
+ 
+  # creacion del API GW route 
+  APIGWRouteBff:
+    Type: 'AWS::ApiGatewayV2::Route'
+    Properties:
+      ApiId: !Ref APIGWHTTPEndpointBff
+      RouteKey: 'ANY /{proxy+}'
+      Target: !Join 
+        - /
+        - - integrations
+          - !Ref APIGWHTTPEndpointIntegrationBff
+    DependsOn:
+    - APIGWHTTPEndpointIntegrationBff
+
+  # creacion del stage
+  APIStageDefaultBff:
+    Type: 'AWS::ApiGatewayV2::Stage'
+    Properties:
+      ApiId: !Ref APIGWHTTPEndpointBff
+      StageName: $default   
+      AutoDeploy: true
+    DependsOn:
+      - APIGWHTTPEndpointBff
+
+
+# creacion de Custom Domains 
+  CustomDomainBff:
+    Type: AWS::ApiGatewayV2::DomainName
+    Properties: 
+      DomainName: !Ref backdomain 
+      DomainNameConfigurations:
+      - EndpointType: REGIONAL
+        CertificateArn: !Ref certificado 
+        CertificateName: smartflux.com  
+   
+# creacion de API mappings 
+  ApiMappingBff:
+    Type: 'AWS::ApiGatewayV2::ApiMapping'
+    Properties:
+      DomainName: !Ref CustomDomainBff   
+      ApiId: !Ref APIGWHTTPEndpointBff 
+      Stage: !Ref APIStageDefaultBff
+
+###################################################################################3
+
+# creacion de AS Target 
+  AutoScalingTargetfrontend:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget 
+    DependsOn: 
+      - Servicefrontend
+    Properties:
+      MinCapacity: !Ref MinContainers
+      MaxCapacity: !Ref MaxContainers
+      ResourceId: !Join ['/', [service, !Ref Cluster , !GetAtt Servicefrontend.Name]]    
+      ScalableDimension: ecs:service:DesiredCount 
+      ServiceNamespace: ecs 
+      RoleARN: !GetAtt AutoScalingRole.Arn
+
+  AutoScalingTargetbff:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget 
+    DependsOn: 
+      - Servicebff
+    Properties:
+      MinCapacity: !Ref MinContainers
+      MaxCapacity: !Ref MaxContainers
+      ResourceId: !Join ['/', [service, !Ref Cluster , !GetAtt Servicebff.Name]]    
+      ScalableDimension: ecs:service:DesiredCount 
+      ServiceNamespace: ecs 
+      RoleARN: !GetAtt AutoScalingRole.Arn
+
+  AutoScalingTargetconsumers:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget 
+    DependsOn: 
+      - Serviceconsumers
+    Properties:
+      MinCapacity: !Ref MinContainers
+      MaxCapacity: !Ref MaxContainers
+      ResourceId: !Join ['/', [service, !Ref Cluster , !GetAtt Serviceconsumers.Name]]    
+      ScalableDimension: ecs:service:DesiredCount 
+      ServiceNamespace: ecs 
+      RoleARN: !GetAtt AutoScalingRole.Arn
+
+  AutoScalingTargetproducer:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget 
+    DependsOn: 
+      - Serviceproducer
+    Properties:
+      MinCapacity: !Ref MinContainers
+      MaxCapacity: !Ref MaxContainers
+      ResourceId: !Join ['/', [service, !Ref Cluster , !GetAtt Serviceproducer.Name]]    
+      ScalableDimension: ecs:service:DesiredCount 
+      ServiceNamespace: ecs 
+      RoleARN: !GetAtt AutoScalingRole.Arn
+
+# creacion de AS policy 
+  AutoScalingPolicyfrontend:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-autoScalingPolicyfrontend'  
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTargetfrontend
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 10
+        ScaleOutCooldown: 10
+        TargetValue: !Ref AutoScalingTargetValue
+
+  AutoScalingPolicybff:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-autoScalingPolicybff'  
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTargetbff
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 10
+        ScaleOutCooldown: 10
+        TargetValue: !Ref AutoScalingTargetValue
+
+  AutoScalingPolicyconsumers:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-autoScalingPolicyconsumers'  
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTargetconsumers
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 10
+        ScaleOutCooldown: 10
+        TargetValue: !Ref AutoScalingTargetValue
+
+  AutoScalingPolicyproducer:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-autoScalingPolicyproducer'  
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTargetproducer
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 10
+        ScaleOutCooldown: 10
+        TargetValue: !Ref AutoScalingTargetValue
+
+# creacion de private namespace para conectividad entre tasks dentro del Cluster x3
+  PrivateNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+        Name: !Sub '${AWS::StackName}-namespace.smartflux'    
+        Vpc: !Ref myVPC
+
+# creacion de service discovery para conectividad entre tasks dentro del Cluster
+  DiscoveryServicefrontend:
+    Type: AWS::ServiceDiscovery::Service
+    Properties: 
+      Description: Discovery Service for the frontend
+      DnsConfig:
+        RoutingPolicy: WEIGHTED
+        DnsRecords:
+          - TTL: 60
+            Type: A
+          - TTL: 60
+            Type: SRV
+      HealthCheckCustomConfig: 
+        FailureThreshold: 1
+      Name: !Sub '${AWS::StackName}-service-discovery-frontend'  
+      NamespaceId: !Ref PrivateNamespace
+
+  DiscoveryServicebff:
+    Type: AWS::ServiceDiscovery::Service
+    Properties: 
+      Description: Discovery Service for the bff
+      DnsConfig:
+        RoutingPolicy: WEIGHTED
+        DnsRecords:
+          - TTL: 60
+            Type: A
+          - TTL: 60
+            Type: SRV
+      HealthCheckCustomConfig: 
+        FailureThreshold: 1
+      Name: !Sub '${AWS::StackName}-service-discovery-bff'  
+      NamespaceId: !Ref PrivateNamespace 
+
+  DiscoveryServiceconsumers:
+    Type: AWS::ServiceDiscovery::Service
+    Properties: 
+      Description: Discovery Service for consumers
+      DnsConfig:
+        RoutingPolicy: WEIGHTED
+        DnsRecords:
+          - TTL: 60
+            Type: A
+          - TTL: 60
+            Type: SRV
+      HealthCheckCustomConfig: 
+        FailureThreshold: 1
+      Name: !Sub '${AWS::StackName}-service-discovery-consumers'  
+      NamespaceId: !Ref PrivateNamespace
+
+  DiscoveryServiceproducer:
+    Type: AWS::ServiceDiscovery::Service
+    Properties: 
+      Description: Discovery Service for the producer
+      DnsConfig:
+        RoutingPolicy: WEIGHTED
+        DnsRecords:
+          - TTL: 60
+            Type: A
+          - TTL: 60
+            Type: SRV
+      HealthCheckCustomConfig: 
+        FailureThreshold: 1
+      Name: !Sub '${AWS::StackName}-service-discovery-producer'  
+      NamespaceId: !Ref PrivateNamespace
+
+
+########################## S3 ###########################
+# Genero un grupo para el/los usuarios
+  IAMgrupoKMS:
+    Type: AWS::IAM::Group
+    Properties: 
+      GroupName: !Join [ "-", [!Ref ambiente, KMS-usuarios]]  
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/AWSKeyManagementServicePowerUser
+
+# Genero un usuario para el KMS
+  usuarioKms:
+    Type: AWS::IAM::User
+    Properties:
+      Groups: 
+        - !Join [ "-", [!Ref ambiente, KMS-usuarios]]  
+      UserName: !Sub '${AWS::StackName}-usuarioKMS'    
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente
+
+# genero la key para encriptar los buckets
+  myKey:
+    Type: 'AWS::KMS::Key'
+    DependsOn: usuarioKms
+    Properties:
+      Description: KMS key para S3 bucket
+      EnableKeyRotation: true
+      PendingWindowInDays: 20
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: !Sub '${AWS::StackName}-kms-s3' 
+        Statement:
+          - Sid: usuario Root de la cuenta con permisos totales (en caso que el resto de los usuarios dejen de existir)
+            Effect: Allow
+            Principal:
+              AWS: !Ref usuarioKMSRoot  
+            Action: 'kms:*'
+            Resource: '*'        
+          - Sid: Allow administration/use of the key
+            Effect: Allow
+            Principal:
+              AWS: 
+                - !GetAtt usuarioKms.Arn   
+                - !Ref roleKMSejecucion 
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+              - 'kms:Create*'
+              - 'kms:Describe*'
+              - 'kms:Enable*'
+              - 'kms:List*'
+              - 'kms:Put*'
+              - 'kms:Update*'
+              - 'kms:Revoke*'
+              - 'kms:Disable*'
+              - 'kms:Get*'
+              - 'kms:Delete*'
+              - 'kms:ScheduleKeyDeletion'
+              - 'kms:CancelKeyDeletion'
+            Resource: '*'
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente
+
+#alias para KMS del bucket bffResources
+  myAliasbffResources:
+    Type: 'AWS::KMS::Alias'
+    Properties:
+      AliasName: !Join [ "/", ["alias", !Sub '${AWS::StackName}-kms-s3-bffResources']]    
+      TargetKeyId: !Ref myKey
+
+#creacion del bucket bffResources
+  S3BucketbffResources:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-bucket-bffresources' 
+##### comentar en la primera ejecucion, luego volver a ejecutar descomentado      (no se puede modificar bucket policy cuando esta privado)        
+      PublicAccessBlockConfiguration: 
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false      
+##### comentar en la primera ejecucion, luego volver a ejecutar descomentado      (no se puede modificar bucket policy cuando esta privado)
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration: 
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: 'aws:kms'
+            KMSMasterKeyID: !Ref myKey     
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods:
+              - GET
+              - PUT
+              - POST
+              - DELETE
+            AllowedOrigins:
+              - "*"
+            AllowedHeaders:
+              - "*"
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente
+
+# creacion de la policy para el bucket bffResources
+  BucketPolicybffResources:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3BucketbffResources
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 's3:DeleteObject'
+              - 's3:DeleteObjectVersion'
+              - 's3:GetObject'
+              - 's3:GetObjectAttributes'
+              - 's3:GetObjectVersion'
+              - 's3:GetObjectVersionAttributes'
+              - 's3:ListBucket'
+              - 's3:PutObject'
+              - 's3:PutObjectAcl' 
+            Effect: Allow
+            Resource:
+              - !Join [ "", ['arn:aws:s3:::', !Ref S3BucketbffResources ,'/*']]
+              - !Join [ "", ['arn:aws:s3:::', !Ref S3BucketbffResources]]
+            Principal: '*'
+    DependsOn:
+      - S3BucketbffResources
+
+
+########################### ECR ########################### 
+# Genero un grupo para el/los usuarios
+  IAMgrupoECR:
+    Type: AWS::IAM::Group
+    Properties: 
+      GroupName: !Join [ "-", [!Ref ambiente, ECR-usuarios]]  
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess              
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+# Genero un usuario para el ECR
+  usuarioECR:
+    Type: AWS::IAM::User
+    Properties:
+      Groups: 
+      - !Join [ "-", [!Ref ambiente, ECR-usuarios]]  
+      UserName: !Sub '${AWS::StackName}-usuarioECR' 
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente
+
+# Repositorio para el frontend
+  Repositoryfrontend: 
+    Type: AWS::ECR::Repository
+    DependsOn: 
+      - usuarioECR
+      - deployUser
+    Properties: 
+      RepositoryName: !Sub '${AWS::StackName}-ecr-frontend' 
+      LifecyclePolicy:
+        LifecyclePolicyText: "{\n \"rules\": [\n {\n  \"rulePriority\": 1,\n  \"description\": \"Mantener ultimas imagenes\",\n  \"selection\": {\n  \"tagStatus\": \"any\",\n  \"countType\": \"imageCountMoreThan\",\n  \"countNumber\": 10\n },\n \"action\": {\n   \"type\": \"expire\"\n  }\n }\n ]\n}\n }"         
+      RepositoryPolicyText: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Sid: AllowPushPull
+            Effect: Allow
+            Principal: 
+              AWS: 
+                - !GetAtt usuarioECR.Arn    
+                - !GetAtt deployUser.Arn 
+                #- !Ref deployUser         
+              Service: 
+                - ecs-tasks.amazonaws.com          
+            Action: 
+              - "ecr:GetAuthorizationToken"
+              - "ecr:GetDownloadUrlForLayer"
+              - "ecr:BatchGetImage"
+              - "ecr:BatchCheckLayerAvailability"
+              - "ecr:PutImage"
+              - "ecr:InitiateLayerUpload"
+              - "ecr:UploadLayerPart"
+              - "ecr:CompleteLayerUpload"
+              - "ecr:*"
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente
+
+# Repositorio para el bff 
+  Repositorybff: 
+    Type: AWS::ECR::Repository
+    DependsOn: 
+      - usuarioECR
+      - deployUser
+    Properties: 
+      RepositoryName: !Sub '${AWS::StackName}-ecr-bff' 
+      LifecyclePolicy:
+        LifecyclePolicyText: "{\n \"rules\": [\n {\n  \"rulePriority\": 1,\n  \"description\": \"Mantener ultimas imagenes\",\n  \"selection\": {\n  \"tagStatus\": \"any\",\n  \"countType\": \"imageCountMoreThan\",\n  \"countNumber\": 10\n },\n \"action\": {\n   \"type\": \"expire\"\n  }\n }\n ]\n}\n }"         
+      RepositoryPolicyText: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Sid: AllowPushPull
+            Effect: Allow
+            Principal: 
+              AWS: 
+                - !GetAtt usuarioECR.Arn    
+                - !GetAtt deployUser.Arn 
+                #- !Ref deployUser          
+              Service: 
+                - ecs-tasks.amazonaws.com                  
+            Action: 
+              - "ecr:GetAuthorizationToken"
+              - "ecr:GetDownloadUrlForLayer"
+              - "ecr:BatchGetImage"
+              - "ecr:BatchCheckLayerAvailability"
+              - "ecr:PutImage"
+              - "ecr:InitiateLayerUpload"
+              - "ecr:UploadLayerPart"
+              - "ecr:CompleteLayerUpload"
+              - "ecr:*"
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente
+
+# Repositorio para consumers 
+  Repositoryconsumers: 
+    Type: AWS::ECR::Repository
+    DependsOn: 
+      - usuarioECR
+      - deployUser
+    Properties: 
+      RepositoryName: !Sub '${AWS::StackName}-ecr-consumers' 
+      LifecyclePolicy:
+        LifecyclePolicyText: "{\n \"rules\": [\n {\n  \"rulePriority\": 1,\n  \"description\": \"Mantener ultimas imagenes\",\n  \"selection\": {\n  \"tagStatus\": \"any\",\n  \"countType\": \"imageCountMoreThan\",\n  \"countNumber\": 10\n },\n \"action\": {\n   \"type\": \"expire\"\n  }\n }\n ]\n}\n }"         
+      RepositoryPolicyText: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Sid: AllowPushPull
+            Effect: Allow
+            Principal: 
+              AWS: 
+                - !GetAtt usuarioECR.Arn    
+                - !GetAtt deployUser.Arn 
+                #- !Ref deployUser             
+              Service: 
+                - ecs-tasks.amazonaws.com                  
+            Action: 
+              - "ecr:GetAuthorizationToken"
+              - "ecr:GetDownloadUrlForLayer"
+              - "ecr:BatchGetImage"
+              - "ecr:BatchCheckLayerAvailability"
+              - "ecr:PutImage"
+              - "ecr:InitiateLayerUpload"
+              - "ecr:UploadLayerPart"
+              - "ecr:CompleteLayerUpload"
+              - "ecr:*"
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente
+
+# Repositorio para producer 
+  Repositoryproducer: 
+    Type: AWS::ECR::Repository
+    DependsOn: 
+      - usuarioECR
+      - deployUser
+    Properties: 
+      RepositoryName: !Sub '${AWS::StackName}-ecr-producer' 
+      LifecyclePolicy:
+        LifecyclePolicyText: "{\n \"rules\": [\n {\n  \"rulePriority\": 1,\n  \"description\": \"Mantener ultimas imagenes\",\n  \"selection\": {\n  \"tagStatus\": \"any\",\n  \"countType\": \"imageCountMoreThan\",\n  \"countNumber\": 10\n },\n \"action\": {\n   \"type\": \"expire\"\n  }\n }\n ]\n}\n }"         
+      RepositoryPolicyText: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Sid: AllowPushPull
+            Effect: Allow
+            Principal: 
+              AWS: 
+                - !GetAtt usuarioECR.Arn    
+                - !GetAtt deployUser.Arn 
+                #- !Ref deployUser            
+              Service: 
+                - ecs-tasks.amazonaws.com                  
+            Action: 
+              - "ecr:GetAuthorizationToken"
+              - "ecr:GetDownloadUrlForLayer"
+              - "ecr:BatchGetImage"
+              - "ecr:BatchCheckLayerAvailability"
+              - "ecr:PutImage"
+              - "ecr:InitiateLayerUpload"
+              - "ecr:UploadLayerPart"
+              - "ecr:CompleteLayerUpload"
+              - "ecr:*"
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente
+
+
+############################# IAM ######################### 
+# Creacion de policy para acceder y ejecutar ECS deployment
+  deployPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      Description: 'deploy policy para ejecutar el pipeline'
+      ManagedPolicyName: !Sub '${AWS::StackName}-deployPolicy'  
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'ecs:RegisterTaskDefinition'
+              - 'iam:PassRole'
+              - 'ecs:UpdateService'
+              - 'ecs:DescribeServices'
+              - 'ecs:DescribeTaskDefinition'
+            Resource: '*'
+
+# Genero un grupo para el/los usuarios
+  IAMgrupoDeploy:
+    Type: AWS::IAM::Group
+    Properties: 
+      GroupName: !Join [ "-", [!Ref ambiente, Deploy-usuarios]]  
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess
+        - arn:aws:iam::aws:policy/AmazonEC2FullAccess
+        - !Ref deployPolicy 
+
+# Genero un usuario para utilizar en el pipeline de despliegue
+  deployUser:
+    Type: AWS::IAM::User
+    #DependsOn: IAMgrupoDeploy
+    Properties:
+      Groups: 
+      - !Join [ "-", [!Ref ambiente, Deploy-usuarios]]      
+      UserName: !Sub '${AWS::StackName}-deployUser' 
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente
+
+# genero las access keys para el usuario deployUser
+  deployAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties: 
+      Status: Active
+      UserName: !Ref deployUser
+
+# Guardo las access keys para el usuario deployUser
+  MySecretDB:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: !Sub '${AWS::StackName}-secrets-deploy'   
+      Description: Deploy pipeline credenciales
+      SecretString: !Join [ "", ['{"accessKeyID":"', !Ref deployAccessKey,'","secretAccessKey":"',!GetAtt deployAccessKey.SecretAccessKey,'"}']]    
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente
+
+
+########################### SES ########################### 
+# creo la policy para el kms
+  SESkmsPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: SESkmsPolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'kms:*'
+            Resource: '*'
+      Users:
+        - !Ref usuarioSES
+        
+# Genero un grupo para el/los usuarios
+  IAMgrupoSES:
+    Type: AWS::IAM::Group
+    Properties: 
+      GroupName: !Join [ "-", [!Ref ambiente, SES-usuarios]]  
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/AmazonSESFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess #creacion de archivos
+        - arn:aws:iam::aws:policy/AWSKeyManagementServicePowerUser #bucket encriptado
+
+# Genero un usuario para el SES
+  usuarioSES:
+    Type: AWS::IAM::User
+    Properties:
+      Groups: 
+      - !Join [ "-", [!Ref ambiente, SES-usuarios]]  
+      UserName: !Sub '${AWS::StackName}-usuarioSES'    
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente
+
+# genero las access keys para el usuario SES
+  usuarioSESAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties: 
+      Status: Active
+      UserName: !Ref usuarioSES
+
+# Guardo las access keys para el usuario SES
+  MySecretDBusuarioSES:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: !Sub '${AWS::StackName}-secrets-SES'   
+      Description: usuario SES credenciales
+      SecretString: !Join [ "", ['{"accessKeyID":"', !Ref usuarioSESAccessKey,'","secretAccessKey":"',!GetAtt usuarioSESAccessKey.SecretAccessKey,'"}']]    
+      Tags:
+      - Key: project
+        Value: smartflux
+      - Key: environment
+        Value: !Ref ambiente
+
+# creacion del configset
+  ConfigSet:
+    Type: 'AWS::SES::ConfigurationSet'
+    Properties:
+      Name: !Sub '${AWS::StackName}-ses-configset'
+
+
+# creacion del email identity
+  EmailIdentity:
+    Type: AWS::SES::EmailIdentity
+    DependsOn: 
+      - ConfigSet
+    Properties: 
+      ConfigurationSetAttributes: {"ConfigurationSetName": !Sub '${AWS::StackName}-ses-configset'}
+      EmailIdentity: !Ref emailIdentity
+      FeedbackAttributes:  {"EmailForwardingEnabled": "true"}
+
